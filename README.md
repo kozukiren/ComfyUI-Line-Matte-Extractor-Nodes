@@ -5,14 +5,16 @@
 
 このリポジトリには以下が含まれます：
 
-* `line_art_extractor.py`
-
+* `line_art_extractor.py`  
   * 単体画像の線画抽出ノード `LineArtExtractor`
+  * 動画ファイルから線画連番を生成するノード `VideoLineArtExtractor`
   * 連番画像フォルダ用の線画抽出ノード `DirectoryLineArtExtractor`
-  * カラーキャラ＋白背景用のマット抽出ノード `DirectoryCharacterMatteExtractor`
-* `透過.json`
 
-  * 上記ノードを使ったサンプルワークフロー（単体画像／連番線画／カラーキャラ透過）
+* `character_matte_extractor.py`  
+  * カラーキャラクター＋白（または黄ばんだ）背景からマットを生成するノード `DirectoryCharacterMatteExtractor`
+
+* `透過.json`  
+  * 上記ノードを使ったサンプルワークフロー（単体画像線画／連番線画／カラーキャラ透過）
 
 ---
 
