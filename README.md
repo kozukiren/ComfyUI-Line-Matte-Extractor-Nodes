@@ -221,4 +221,6 @@ PNG / JPG 連番が入ったフォルダから **全フレームの線画をま�
 
 * KALIN
 
-フィードバックや改善案があれば X　https://x.com/kozukiren　でぜひ教えてください。
+フィードバックや改善案があれば X　
+https://x.com/kozukiren
+でぜひ教えてください。
