@@ -8,6 +8,11 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 
 class CharacterMatteExtractorBase:
     def _estimate_background(self, img: torch.Tensor, corner: int = 16) -> torch.Tensor:
@@ -47,32 +52,39 @@ class CharacterMatteExtractorBase:
         bg_candidate: bool [H, W] – paper-like candidate pixels.
         Returns a bool mask [H, W] where True means “background connected to image border”.
         """
-        h, w = bg_candidate.shape
-        visited = torch.zeros_like(bg_candidate, dtype=torch.bool)
-        q = deque()
+        if cv2 is None:
+            raise ImportError("OpenCV (cv2) is required for this node. Please install it with: pip install opencv-python")
 
+        # Convert to uint8 for OpenCV
+        mask = bg_candidate.cpu().numpy().astype(np.uint8) * 255
+        h, w = mask.shape
+        
+        # Mask for floodFill must be 2 pixels larger in both dimensions
+        # and initialized to 0.
+        fill_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        
+        # Flood fill from all border pixels
+        # Top and bottom
         for x in range(w):
-            if bg_candidate[0, x]:
-                q.append((0, x))
-            if bg_candidate[h - 1, x]:
-                q.append((h - 1, x))
+            if mask[0, x] == 255:
+                cv2.floodFill(mask, fill_mask, (x, 0), 128)
+            if mask[h - 1, x] == 255:
+                cv2.floodFill(mask, fill_mask, (x, h - 1), 128)
+                
+        # Left and right
         for y in range(h):
-            if bg_candidate[y, 0]:
-                q.append((y, 0))
-            if bg_candidate[y, w - 1]:
-                q.append((y, w - 1))
+            if mask[y, 0] == 255:
+                cv2.floodFill(mask, fill_mask, (0, y), 128)
+            if mask[y, w - 1] == 255:
+                cv2.floodFill(mask, fill_mask, (w - 1, y), 128)
 
-        while q:
-            y, x = q.popleft()
-            if visited[y, x]:
-                continue
-            visited[y, x] = True
-            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
-                if 0 <= ny < h and 0 <= nx < w:
-                    if bg_candidate[ny, nx] and not visited[ny, nx]:
-                        q.append((ny, nx))
-
-        return visited
+        # Pixels that were filled are now 128. Returns True where filled.
+        # Note: We modified 'mask' in-place with 128 where filled.
+        # But 'fill_mask' also tracks where it filled (roi).
+        # To be safe and consistent with logic: 
+        # The filled area (connected to border) is now 128. Original bg_candidate was 255.
+        
+        return torch.from_numpy(mask == 128).to(bg_candidate.device)
 
     def _close_gaps(self, alpha: torch.Tensor, radius: int) -> torch.Tensor:
         if radius <= 0:
@@ -120,40 +132,41 @@ class CharacterMatteExtractorBase:
     def _remove_small_components(self, alpha: torch.Tensor, min_area: int) -> torch.Tensor:
         if min_area <= 0:
             return alpha
+        if cv2 is None:
+            raise ImportError("OpenCV (cv2) is required for this node.")
 
-        fg_mask = alpha >= 0.5
-        h, w = fg_mask.shape
-        visited = torch.zeros_like(fg_mask, dtype=torch.bool)
-        alpha_out = alpha.clone()
+        # alpha is float 0.0-1.0. Convert to uint8 binary mask.
+        mask = (alpha.cpu().numpy() >= 0.5).astype(np.uint8) * 255
+        
+        # Connected components with stats
+        # connectivity=8 is standard
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        
+        # stats: [x, y, width, height, area]
+        # Label 0 is usually background (but here mask=255 is the object we care about).
+        # Actually in opencv, 0 is background (value 0).
+        # We want to keep components where area >= min_area.
+        
+        new_mask = np.zeros_like(mask)
+        
+        for i in range(1, num_labels): # Skip label 0 (black background)
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area >= min_area:
+                # Keep this component
+                new_mask[labels == i] = 255
+                
+            # Extra check: In original logic, we preserved components touching borders?
+            # Original code: "if len(coords) < min_area and not touches_border: remove"
+            # It means: if it touches border, we keep it EVEN IF small.
+            # Let's replicate this logic using bounding box.
+            else:
+                x, y, w, h = stats[i, :4]
+                img_h, img_w = mask.shape
+                touches_border = (x == 0) or (y == 0) or (x + w == img_w) or (y + h == img_h)
+                if touches_border:
+                    new_mask[labels == i] = 255
 
-        for y in range(h):
-            for x in range(w):
-                if not fg_mask[y, x] or visited[y, x]:
-                    continue
-
-                q = deque()
-                q.append((y, x))
-                coords = []
-                touches_border = False
-
-                while q:
-                    cy, cx = q.popleft()
-                    if visited[cy, cx] or not fg_mask[cy, cx]:
-                        continue
-                    visited[cy, cx] = True
-                    coords.append((cy, cx))
-                    if cy == 0 or cy == h - 1 or cx == 0 or cx == w - 1:
-                        touches_border = True
-                    for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
-                        if 0 <= ny < h and 0 <= nx < w:
-                            if fg_mask[ny, nx] and not visited[ny, nx]:
-                                q.append((ny, nx))
-
-                if len(coords) < min_area and not touches_border:
-                    for cy, cx in coords:
-                        alpha_out[cy, cx] = 0.0
-
-        return alpha_out
+        return torch.from_numpy(new_mask.astype(np.float32) / 255.0).to(alpha.device)
 
     def _remove_large_holes(
         self,
@@ -163,36 +176,48 @@ class CharacterMatteExtractorBase:
     ) -> torch.Tensor:
         if min_area <= 0:
             return alpha
+        if cv2 is None:
+            raise ImportError("OpenCV (cv2) is required for this node.")
 
-        h, w = holes_mask.shape
-        visited = torch.zeros_like(holes_mask, dtype=torch.bool)
-        alpha_out = alpha.clone()
+        # holes_mask is True where there is a hole.
+        # We want to remove holes that are SMALLER than min_area? 
+        # Original logic: "if len(coords) >= min_area: set alpha to 0"
+        # Wait, the method name is _remove_large_holes.
+        # Original: iterates holes. If hole size >= min_area, it sets alpha=0 (hole remains hole?).
+        # Let's re-read original `_remove_large_holes`.
+        #   if len(coords) >= min_area:
+        #       for cy, cx in coords:
+        #           alpha_out[cy, cx] = 0.0
+        #
+        # Input 'alpha' has 1.0 where it's foreground (or filled hole initially).
+        # 'holes_mask' identifies potential holes (bg_candidate & ~bg_mask).
+        # Actually, in 'extract':
+        #   bg_mask = flood_fill(bg_candidate) -> True if connected to border (real BG)
+        #   holes_mask = bg_candidate & (~bg_mask) -> True for "bg-like pixels NOT connected to border" (i.e. holes inside char)
+        #   alpha = (~bg_mask).float() -> True for everything EXCEPT border-connected BG. (So holes are currently 1.0 in alpha!)
+        #   
+        #   Then `_remove_large_holes(alpha, holes_mask, min_hole_area)`:
+        #   It finds connected components in `holes_mask`.
+        #   If a component size >= min_area (it's a "large hole"), we set alpha=0.0 there.
+        #   So "Large holes" become transparent (0.0). "Small holes" remain opaque (1.0).
+        #   Yes, this makes sense. We want to punch out large background areas inside the character, but keep small noise as foreground.
 
-        for y in range(h):
-            for x in range(w):
-                if not holes_mask[y, x] or visited[y, x]:
-                    continue
-
-                q = deque()
-                q.append((y, x))
-                coords = []
-
-                while q:
-                    cy, cx = q.popleft()
-                    if visited[cy, cx] or not holes_mask[cy, cx]:
-                        continue
-                    visited[cy, cx] = True
-                    coords.append((cy, cx))
-                    for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
-                        if 0 <= ny < h and 0 <= nx < w:
-                            if holes_mask[ny, nx] and not visited[ny, nx]:
-                                q.append((ny, nx))
-
-                if len(coords) >= min_area:
-                    for cy, cx in coords:
-                        alpha_out[cy, cx] = 0.0
-
-        return alpha_out
+        mask = holes_mask.cpu().numpy().astype(np.uint8) * 255
+        
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        
+        # alpha is currently tensor.
+        alpha_np = alpha.cpu().numpy().copy()
+        
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area >= min_area:
+                # This is a large hole. Punch it out (set to 0).
+                # Label i corresponds to this hole.
+                # In alpha_np, these pixels are currently 1.0 (because they were not border-bg).
+                alpha_np[labels == i] = 0.0
+                
+        return torch.from_numpy(alpha_np).to(alpha.device)
 
     def _process_image(
         self,
@@ -212,9 +237,12 @@ class CharacterMatteExtractorBase:
             fg_mask = (~bg_candidate).float()
             fg_mask = self._close_gaps(fg_mask, int(close_gaps))
             bg_candidate = ~(fg_mask > 0.5)
+            
         bg_mask = self._flood_fill_from_border(bg_candidate)
+        
         holes_mask = bg_candidate & (~bg_mask)
         alpha = (~bg_mask).float()
+        
         if matte_shift != 0:
             alpha = self._shift_matte(alpha, int(matte_shift))
         if min_hole_area > 0:
@@ -223,6 +251,7 @@ class CharacterMatteExtractorBase:
             alpha = self._remove_small_components(alpha, int(min_foreground_area))
         if edge_feather > 0:
             alpha = self._feather(alpha, int(edge_feather))
+            
         rgba = torch.cat([img, alpha.unsqueeze(-1)], dim=-1)
         return rgba
 
