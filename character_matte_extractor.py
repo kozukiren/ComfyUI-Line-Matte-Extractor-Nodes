@@ -9,41 +9,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 
-class DirectoryCharacterMatteExtractor:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "directory_path": ("STRING", {"default": ""}),
-                "bg_tolerance": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "value_min": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "saturation_max": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "close_gaps": ("INT", {"default": 1, "min": 0, "max": 5, "step": 1}),
-                "edge_feather": ("INT", {"default": 2, "min": 0, "max": 20, "step": 1}),
-                "matte_shift": ("INT", {"default": 0, "min": -20, "max": 20, "step": 1}),
-                "min_foreground_area": ("INT", {"default": 16, "min": 0, "max": 10000, "step": 1}),
-                "min_hole_area": ("INT", {"default": 128, "min": 0, "max": 100000, "step": 1}),
-            }
-        }
-
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("images",)
-    FUNCTION = "extract"
-    CATEGORY = "image/matting"
-
-    def _list_images(self, directory: str) -> List[pathlib.Path]:
-        exts = {".png", ".jpg", ".jpeg"}
-        root = pathlib.Path(directory).expanduser()
-        if not root.is_dir():
-            raise ValueError(f"Directory not found: {root}")
-        return [p for p in sorted(root.iterdir()) if p.suffix.lower() in exts and p.is_file()]
-
-    def _load_image(self, path: pathlib.Path) -> torch.Tensor:
-        with Image.open(path) as im:
-            rgb = im.convert("RGB")
-            arr = np.asarray(rgb, dtype=np.float32) / 255.0
-        return torch.from_numpy(arr)
-
+class CharacterMatteExtractorBase:
     def _estimate_background(self, img: torch.Tensor, corner: int = 16) -> torch.Tensor:
         h, w, _ = img.shape
         c = max(1, min(corner, h // 2, w // 2))
@@ -228,6 +194,74 @@ class DirectoryCharacterMatteExtractor:
 
         return alpha_out
 
+    def _process_image(
+        self,
+        img: torch.Tensor,
+        bg_tolerance: float,
+        value_min: float,
+        saturation_max: float,
+        close_gaps: int,
+        edge_feather: int,
+        matte_shift: int,
+        min_foreground_area: int,
+        min_hole_area: int,
+    ) -> torch.Tensor:
+        bg_color = self._estimate_background(img)
+        bg_candidate = self._make_bg_candidate(img, bg_color, bg_tolerance, value_min, saturation_max)
+        if close_gaps > 0:
+            fg_mask = (~bg_candidate).float()
+            fg_mask = self._close_gaps(fg_mask, int(close_gaps))
+            bg_candidate = ~(fg_mask > 0.5)
+        bg_mask = self._flood_fill_from_border(bg_candidate)
+        holes_mask = bg_candidate & (~bg_mask)
+        alpha = (~bg_mask).float()
+        if matte_shift != 0:
+            alpha = self._shift_matte(alpha, int(matte_shift))
+        if min_hole_area > 0:
+            alpha = self._remove_large_holes(alpha, holes_mask, int(min_hole_area))
+        if min_foreground_area > 0:
+            alpha = self._remove_small_components(alpha, int(min_foreground_area))
+        if edge_feather > 0:
+            alpha = self._feather(alpha, int(edge_feather))
+        rgba = torch.cat([img, alpha.unsqueeze(-1)], dim=-1)
+        return rgba
+
+
+class DirectoryCharacterMatteExtractor(CharacterMatteExtractorBase):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "directory_path": ("STRING", {"default": ""}),
+                "bg_tolerance": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "value_min": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "saturation_max": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "close_gaps": ("INT", {"default": 1, "min": 0, "max": 5, "step": 1}),
+                "edge_feather": ("INT", {"default": 2, "min": 0, "max": 20, "step": 1}),
+                "matte_shift": ("INT", {"default": 0, "min": -20, "max": 20, "step": 1}),
+                "min_foreground_area": ("INT", {"default": 16, "min": 0, "max": 10000, "step": 1}),
+                "min_hole_area": ("INT", {"default": 128, "min": 0, "max": 100000, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "extract"
+    CATEGORY = "image/matting"
+
+    def _list_images(self, directory: str) -> List[pathlib.Path]:
+        exts = {".png", ".jpg", ".jpeg"}
+        root = pathlib.Path(directory).expanduser()
+        if not root.is_dir():
+            raise ValueError(f"Directory not found: {root}")
+        return [p for p in sorted(root.iterdir()) if p.suffix.lower() in exts and p.is_file()]
+
+    def _load_image(self, path: pathlib.Path) -> torch.Tensor:
+        with Image.open(path) as im:
+            rgb = im.convert("RGB")
+            arr = np.asarray(rgb, dtype=np.float32) / 255.0
+        return torch.from_numpy(arr)
+
     def extract(
         self,
         directory_path: str,
@@ -246,28 +280,80 @@ class DirectoryCharacterMatteExtractor:
         images = []
         for path in paths:
             img = self._load_image(path)
-            bg_color = self._estimate_background(img)
-            bg_candidate = self._make_bg_candidate(img, bg_color, bg_tolerance, value_min, saturation_max)
-            if close_gaps > 0:
-                fg_mask = (~bg_candidate).float()
-                fg_mask = self._close_gaps(fg_mask, int(close_gaps))
-                bg_candidate = ~(fg_mask > 0.5)
-            bg_mask = self._flood_fill_from_border(bg_candidate)
-            holes_mask = bg_candidate & (~bg_mask)
-            alpha = (~bg_mask).float()
-            if matte_shift != 0:
-                alpha = self._shift_matte(alpha, int(matte_shift))
-            if min_hole_area > 0:
-                alpha = self._remove_large_holes(alpha, holes_mask, int(min_hole_area))
-            if min_foreground_area > 0:
-                alpha = self._remove_small_components(alpha, int(min_foreground_area))
-            if edge_feather > 0:
-                alpha = self._feather(alpha, int(edge_feather))
-            rgba = torch.cat([img, alpha.unsqueeze(-1)], dim=-1)
+            rgba = self._process_image(
+                img,
+                bg_tolerance,
+                value_min,
+                saturation_max,
+                close_gaps,
+                edge_feather,
+                matte_shift,
+                min_foreground_area,
+                min_hole_area,
+            )
             images.append(rgba)
         batch = torch.stack(images, dim=0).clamp(0.0, 1.0)
         return (batch,)
 
 
-NODE_CLASS_MAPPINGS = {"DirectoryCharacterMatteExtractor": DirectoryCharacterMatteExtractor}
-NODE_DISPLAY_NAME_MAPPINGS = {"DirectoryCharacterMatteExtractor": "Directory Character Matte Extractor"}
+class CharacterMatteExtractor(CharacterMatteExtractorBase):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "bg_tolerance": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "value_min": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "saturation_max": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "close_gaps": ("INT", {"default": 1, "min": 0, "max": 5, "step": 1}),
+                "edge_feather": ("INT", {"default": 2, "min": 0, "max": 20, "step": 1}),
+                "matte_shift": ("INT", {"default": 0, "min": -20, "max": 20, "step": 1}),
+                "min_foreground_area": ("INT", {"default": 16, "min": 0, "max": 10000, "step": 1}),
+                "min_hole_area": ("INT", {"default": 128, "min": 0, "max": 100000, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "extract"
+    CATEGORY = "image/matting"
+
+    def extract(
+        self,
+        images: torch.Tensor,
+        bg_tolerance: float,
+        value_min: float,
+        saturation_max: float,
+        close_gaps: int,
+        edge_feather: int,
+        matte_shift: int,
+        min_foreground_area: int,
+        min_hole_area: int,
+    ):
+        results = []
+        for img in images:
+            rgba = self._process_image(
+                img,
+                bg_tolerance,
+                value_min,
+                saturation_max,
+                close_gaps,
+                edge_feather,
+                matte_shift,
+                min_foreground_area,
+                min_hole_area,
+            )
+            results.append(rgba)
+        
+        batch = torch.stack(results, dim=0).clamp(0.0, 1.0)
+        return (batch,)
+
+
+NODE_CLASS_MAPPINGS = {
+    "DirectoryCharacterMatteExtractor": DirectoryCharacterMatteExtractor,
+    "CharacterMatteExtractor": CharacterMatteExtractor,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "DirectoryCharacterMatteExtractor": "Directory Character Matte Extractor",
+    "CharacterMatteExtractor": "Character Matte Extractor",
+}
