@@ -30,6 +30,7 @@
 
 ※ 通常は `ComfyUI-Manager` で依存関係を自動インストールするか、
 仮想環境上で `pip install pillow numpy opencv-python` で導入してください。
+requirements.txt を使う場合は `pip install -r requirements.txt` を実行してください。
 
 ---
 
@@ -48,9 +49,18 @@
 
    もしくはフォルダごと `custom_nodes` 配下へドラッグ＆ドロップ。
 
-3. ComfyUI を再起動
+3. 依存ライブラリをインストール（requirements.txt を使う場合）
 
-4. ノード検索 (`TAB` / `右クリック → ノードを追加`) で
+   ```bash
+   cd custom_nodes/ComfyUI-Line-Matte-Extractor-Nodes
+   pip install -r requirements.txt
+   ```
+
+   ※ ComfyUI-Manager でインストールする場合は不要
+
+4. ComfyUI を再起動
+
+5. ノード検索 (`TAB` / `右クリック → ノードを追加`) で
 
    * `Line Art Extractor (PNG)`
    * `Directory Line Art Extractor`
@@ -128,6 +138,10 @@ PNG / JPG 連番が入ったフォルダから **全フレームの線画をま�
 * `directory_path` : STRING
 
   * PNG / JPG 連番フォルダ
+* `background_color` : STRING (default "#FFFFFF")
+
+  * 背景紙の色をHEXで指定します（例: #FFFFFF）。
+  * ノードの「Pick Color」ボタンでカラーピッカー（EyeDropper API 対応ブラウザ）から取得可能。
 * `bg_tolerance` : FLOAT (default 0.10)
 
   * 推定した紙色とどれくらい近い色まで紙とみなすか
