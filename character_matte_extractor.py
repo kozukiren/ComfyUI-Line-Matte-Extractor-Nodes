@@ -8,72 +8,44 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
-class DirectoryCharacterMatteExtractor:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "directory_path": ("STRING", {"default": ""}),
-                "bg_tolerance": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "value_min": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "saturation_max": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "close_gaps": ("INT", {"default": 1, "min": 0, "max": 5, "step": 1}),
-                "edge_feather": ("INT", {"default": 2, "min": 0, "max": 20, "step": 1}),
-                "matte_shift": ("INT", {"default": 0, "min": -20, "max": 20, "step": 1}),
-                "min_foreground_area": ("INT", {"default": 16, "min": 0, "max": 10000, "step": 1}),
-                "min_hole_area": ("INT", {"default": 128, "min": 0, "max": 100000, "step": 1}),
-            }
-        }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("images",)
-    FUNCTION = "extract"
-    CATEGORY = "image/matting"
-
-    def _list_images(self, directory: str) -> List[pathlib.Path]:
-        exts = {".png", ".jpg", ".jpeg"}
-        root = pathlib.Path(directory).expanduser()
-        if not root.is_dir():
-            raise ValueError(f"Directory not found: {root}")
-        return [p for p in sorted(root.iterdir()) if p.suffix.lower() in exts and p.is_file()]
-
-    def _load_image(self, path: pathlib.Path) -> torch.Tensor:
-        with Image.open(path) as im:
-            rgb = im.convert("RGB")
-            arr = np.asarray(rgb, dtype=np.float32) / 255.0
-        return torch.from_numpy(arr)
-
-    def _estimate_background(self, img: torch.Tensor, corner: int = 16) -> torch.Tensor:
-        h, w, _ = img.shape
-        c = max(1, min(corner, h // 2, w // 2))
-        patches = [
-            img[0:c, 0:c],
-            img[0:c, w - c : w],
-            img[h - c : h, 0:c],
-            img[h - c : h, w - c : w],
-        ]
-        bg = torch.stack([p.reshape(-1, 3).mean(dim=0) for p in patches], dim=0).mean(dim=0)
-        return bg
-
-    def _rgb_to_sv(self, img: torch.Tensor) -> (torch.Tensor, torch.Tensor):
-        max_c, _ = img.max(dim=-1)
-        min_c, _ = img.min(dim=-1)
-        value = max_c
-        saturation = (max_c - min_c) / (max_c + 1e-6)
-        return saturation, value
+class CharacterMatteExtractorBase:
+    def _parse_hex_color(self, hex_color: str) -> torch.Tensor:
+        hex_color = hex_color.strip().lstrip("#")
+        if not hex_color:
+            return torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32) # Default white
+            
+        try:
+            if len(hex_color) == 6:
+                r, g, b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+            elif len(hex_color) == 3:
+                r, g, b = tuple(int(hex_color[i]*2, 16) for i in (0, 1, 2))
+            else:
+                 return torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32)
+            
+            return torch.tensor([r, g, b], dtype=torch.float32) / 255.0
+        except ValueError:
+            return torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32)
 
     def _make_bg_candidate(
         self,
         img: torch.Tensor,
         bg_color: torch.Tensor,
-        bg_tolerance: float,
-        value_min: float,
-        saturation_max: float,
+        threshold: float,
     ) -> torch.Tensor:
+        # Move bg_color to same device as img
+        bg_color = bg_color.to(img.device)
+        
+        # Calculate Euclidean distance in RGB space
         diff = torch.sqrt(torch.sum((img - bg_color) ** 2, dim=-1))
-        saturation, value = self._rgb_to_sv(img)
-        is_bg_candidate = (diff <= bg_tolerance) & (value >= value_min) & (saturation <= saturation_max)
+        
+        # Simple thresholding based on color distance
+        is_bg_candidate = (diff <= threshold)
         return is_bg_candidate
 
     def _flood_fill_from_border(self, bg_candidate: torch.Tensor) -> torch.Tensor:
@@ -81,32 +53,39 @@ class DirectoryCharacterMatteExtractor:
         bg_candidate: bool [H, W] – paper-like candidate pixels.
         Returns a bool mask [H, W] where True means “background connected to image border”.
         """
-        h, w = bg_candidate.shape
-        visited = torch.zeros_like(bg_candidate, dtype=torch.bool)
-        q = deque()
+        if cv2 is None:
+            raise ImportError("OpenCV (cv2) is required for this node. Please install it with: pip install opencv-python")
 
+        # Convert to uint8 for OpenCV
+        mask = bg_candidate.cpu().numpy().astype(np.uint8) * 255
+        h, w = mask.shape
+        
+        # Mask for floodFill must be 2 pixels larger in both dimensions
+        # and initialized to 0.
+        fill_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        
+        # Flood fill from all border pixels
+        # Top and bottom
         for x in range(w):
-            if bg_candidate[0, x]:
-                q.append((0, x))
-            if bg_candidate[h - 1, x]:
-                q.append((h - 1, x))
+            if mask[0, x] == 255:
+                cv2.floodFill(mask, fill_mask, (x, 0), 128)
+            if mask[h - 1, x] == 255:
+                cv2.floodFill(mask, fill_mask, (x, h - 1), 128)
+                
+        # Left and right
         for y in range(h):
-            if bg_candidate[y, 0]:
-                q.append((y, 0))
-            if bg_candidate[y, w - 1]:
-                q.append((y, w - 1))
+            if mask[y, 0] == 255:
+                cv2.floodFill(mask, fill_mask, (0, y), 128)
+            if mask[y, w - 1] == 255:
+                cv2.floodFill(mask, fill_mask, (w - 1, y), 128)
 
-        while q:
-            y, x = q.popleft()
-            if visited[y, x]:
-                continue
-            visited[y, x] = True
-            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
-                if 0 <= ny < h and 0 <= nx < w:
-                    if bg_candidate[ny, nx] and not visited[ny, nx]:
-                        q.append((ny, nx))
-
-        return visited
+        # Pixels that were filled are now 128. Returns True where filled.
+        # Note: We modified 'mask' in-place with 128 where filled.
+        # But 'fill_mask' also tracks where it filled (roi).
+        # To be safe and consistent with logic: 
+        # The filled area (connected to border) is now 128. Original bg_candidate was 255.
+        
+        return torch.from_numpy(mask == 128).to(bg_candidate.device)
 
     def _close_gaps(self, alpha: torch.Tensor, radius: int) -> torch.Tensor:
         if radius <= 0:
@@ -154,40 +133,38 @@ class DirectoryCharacterMatteExtractor:
     def _remove_small_components(self, alpha: torch.Tensor, min_area: int) -> torch.Tensor:
         if min_area <= 0:
             return alpha
+        if cv2 is None:
+            raise ImportError("OpenCV (cv2) is required for this node.")
 
-        fg_mask = alpha >= 0.5
-        h, w = fg_mask.shape
-        visited = torch.zeros_like(fg_mask, dtype=torch.bool)
-        alpha_out = alpha.clone()
+        # alpha is float 0.0-1.0. Convert to uint8 binary mask.
+        mask = (alpha.cpu().numpy() >= 0.5).astype(np.uint8) * 255
+        
+        # Connected components with stats
+        # connectivity=8 is standard
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        
+        # stats: [x, y, width, height, area]
+        
+        new_mask = np.zeros_like(mask)
+        
+        for i in range(1, num_labels): # Skip label 0 (black background)
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area >= min_area:
+                # Keep this component
+                new_mask[labels == i] = 255
+                
+            # Extra check: In original logic, we preserved components touching borders?
+            # Original code: "if len(coords) < min_area and not touches_border: remove"
+            # It means: if it touches border, we keep it EVEN IF small.
+            # Let's replicate this logic using bounding box.
+            else:
+                x, y, w, h = stats[i, :4]
+                img_h, img_w = mask.shape
+                touches_border = (x == 0) or (y == 0) or (x + w == img_w) or (y + h == img_h)
+                if touches_border:
+                    new_mask[labels == i] = 255
 
-        for y in range(h):
-            for x in range(w):
-                if not fg_mask[y, x] or visited[y, x]:
-                    continue
-
-                q = deque()
-                q.append((y, x))
-                coords = []
-                touches_border = False
-
-                while q:
-                    cy, cx = q.popleft()
-                    if visited[cy, cx] or not fg_mask[cy, cx]:
-                        continue
-                    visited[cy, cx] = True
-                    coords.append((cy, cx))
-                    if cy == 0 or cy == h - 1 or cx == 0 or cx == w - 1:
-                        touches_border = True
-                    for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
-                        if 0 <= ny < h and 0 <= nx < w:
-                            if fg_mask[ny, nx] and not visited[ny, nx]:
-                                q.append((ny, nx))
-
-                if len(coords) < min_area and not touches_border:
-                    for cy, cx in coords:
-                        alpha_out[cy, cx] = 0.0
-
-        return alpha_out
+        return torch.from_numpy(new_mask.astype(np.float32) / 255.0).to(alpha.device)
 
     def _remove_large_holes(
         self,
@@ -197,43 +174,98 @@ class DirectoryCharacterMatteExtractor:
     ) -> torch.Tensor:
         if min_area <= 0:
             return alpha
+        if cv2 is None:
+            raise ImportError("OpenCV (cv2) is required for this node.")
 
-        h, w = holes_mask.shape
-        visited = torch.zeros_like(holes_mask, dtype=torch.bool)
-        alpha_out = alpha.clone()
+        mask = holes_mask.cpu().numpy().astype(np.uint8) * 255
+        
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        
+        # alpha is currently tensor.
+        alpha_np = alpha.cpu().numpy().copy()
+        
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area >= min_area:
+                # This is a large hole. Punch it out (set to 0).
+                alpha_np[labels == i] = 0.0
+                
+        return torch.from_numpy(alpha_np).to(alpha.device)
 
-        for y in range(h):
-            for x in range(w):
-                if not holes_mask[y, x] or visited[y, x]:
-                    continue
+    def _process_image(
+        self,
+        img: torch.Tensor,
+        bg_color_tensor: torch.Tensor,
+        threshold: float,
+        close_gaps: int,
+        edge_feather: int,
+        matte_shift: int,
+        min_foreground_area: int,
+        min_hole_area: int,
+    ) -> torch.Tensor:
+        bg_candidate = self._make_bg_candidate(img, bg_color_tensor, threshold)
+        if close_gaps > 0:
+            fg_mask = (~bg_candidate).float()
+            fg_mask = self._close_gaps(fg_mask, int(close_gaps))
+            bg_candidate = ~(fg_mask > 0.5)
+            
+        bg_mask = self._flood_fill_from_border(bg_candidate)
+        
+        holes_mask = bg_candidate & (~bg_mask)
+        alpha = (~bg_mask).float()
+        
+        if matte_shift != 0:
+            alpha = self._shift_matte(alpha, int(matte_shift))
+        if min_hole_area > 0:
+            alpha = self._remove_large_holes(alpha, holes_mask, int(min_hole_area))
+        if min_foreground_area > 0:
+            alpha = self._remove_small_components(alpha, int(min_foreground_area))
+        if edge_feather > 0:
+            alpha = self._feather(alpha, int(edge_feather))
+            
+        rgba = torch.cat([img, alpha.unsqueeze(-1)], dim=-1)
+        return rgba
 
-                q = deque()
-                q.append((y, x))
-                coords = []
 
-                while q:
-                    cy, cx = q.popleft()
-                    if visited[cy, cx] or not holes_mask[cy, cx]:
-                        continue
-                    visited[cy, cx] = True
-                    coords.append((cy, cx))
-                    for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
-                        if 0 <= ny < h and 0 <= nx < w:
-                            if holes_mask[ny, nx] and not visited[ny, nx]:
-                                q.append((ny, nx))
+class DirectoryCharacterMatteExtractor(CharacterMatteExtractorBase):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "directory_path": ("STRING", {"default": ""}),
+                "background_color": ("STRING", {"default": "#FFFFFF", "multiline": False}),
+                "threshold": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "close_gaps": ("INT", {"default": 1, "min": 0, "max": 5, "step": 1}),
+                "edge_feather": ("INT", {"default": 2, "min": 0, "max": 20, "step": 1}),
+                "matte_shift": ("INT", {"default": 0, "min": -20, "max": 20, "step": 1}),
+                "min_foreground_area": ("INT", {"default": 16, "min": 0, "max": 10000, "step": 1}),
+                "min_hole_area": ("INT", {"default": 128, "min": 0, "max": 100000, "step": 1}),
+            }
+        }
 
-                if len(coords) >= min_area:
-                    for cy, cx in coords:
-                        alpha_out[cy, cx] = 0.0
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "extract"
+    CATEGORY = "image/matting"
 
-        return alpha_out
+    def _list_images(self, directory: str) -> List[pathlib.Path]:
+        exts = {".png", ".jpg", ".jpeg"}
+        root = pathlib.Path(directory).expanduser()
+        if not root.is_dir():
+            raise ValueError(f"Directory not found: {root}")
+        return [p for p in sorted(root.iterdir()) if p.suffix.lower() in exts and p.is_file()]
+
+    def _load_image(self, path: pathlib.Path) -> torch.Tensor:
+        with Image.open(path) as im:
+            rgb = im.convert("RGB")
+            arr = np.asarray(rgb, dtype=np.float32) / 255.0
+        return torch.from_numpy(arr)
 
     def extract(
         self,
         directory_path: str,
-        bg_tolerance: float,
-        value_min: float,
-        saturation_max: float,
+        background_color: str,
+        threshold: float,
         close_gaps: int,
         edge_feather: int,
         matte_shift: int,
@@ -243,31 +275,83 @@ class DirectoryCharacterMatteExtractor:
         paths = self._list_images(directory_path)
         if not paths:
             raise ValueError("No PNG/JPG images found in the directory.")
+        
+        bg_color_tensor = self._parse_hex_color(background_color)
+        
         images = []
         for path in paths:
             img = self._load_image(path)
-            bg_color = self._estimate_background(img)
-            bg_candidate = self._make_bg_candidate(img, bg_color, bg_tolerance, value_min, saturation_max)
-            if close_gaps > 0:
-                fg_mask = (~bg_candidate).float()
-                fg_mask = self._close_gaps(fg_mask, int(close_gaps))
-                bg_candidate = ~(fg_mask > 0.5)
-            bg_mask = self._flood_fill_from_border(bg_candidate)
-            holes_mask = bg_candidate & (~bg_mask)
-            alpha = (~bg_mask).float()
-            if matte_shift != 0:
-                alpha = self._shift_matte(alpha, int(matte_shift))
-            if min_hole_area > 0:
-                alpha = self._remove_large_holes(alpha, holes_mask, int(min_hole_area))
-            if min_foreground_area > 0:
-                alpha = self._remove_small_components(alpha, int(min_foreground_area))
-            if edge_feather > 0:
-                alpha = self._feather(alpha, int(edge_feather))
-            rgba = torch.cat([img, alpha.unsqueeze(-1)], dim=-1)
+            rgba = self._process_image(
+                img,
+                bg_color_tensor,
+                threshold,
+                close_gaps,
+                edge_feather,
+                matte_shift,
+                min_foreground_area,
+                min_hole_area,
+            )
             images.append(rgba)
         batch = torch.stack(images, dim=0).clamp(0.0, 1.0)
         return (batch,)
 
 
-NODE_CLASS_MAPPINGS = {"DirectoryCharacterMatteExtractor": DirectoryCharacterMatteExtractor}
-NODE_DISPLAY_NAME_MAPPINGS = {"DirectoryCharacterMatteExtractor": "Directory Character Matte Extractor"}
+class CharacterMatteExtractor(CharacterMatteExtractorBase):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "background_color": ("STRING", {"default": "#FFFFFF", "multiline": False}),
+                "threshold": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "close_gaps": ("INT", {"default": 1, "min": 0, "max": 5, "step": 1}),
+                "edge_feather": ("INT", {"default": 2, "min": 0, "max": 20, "step": 1}),
+                "matte_shift": ("INT", {"default": 0, "min": -20, "max": 20, "step": 1}),
+                "min_foreground_area": ("INT", {"default": 16, "min": 0, "max": 10000, "step": 1}),
+                "min_hole_area": ("INT", {"default": 128, "min": 0, "max": 100000, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "extract"
+    CATEGORY = "image/matting"
+
+    def extract(
+        self,
+        images: torch.Tensor,
+        background_color: str,
+        threshold: float,
+        close_gaps: int,
+        edge_feather: int,
+        matte_shift: int,
+        min_foreground_area: int,
+        min_hole_area: int,
+    ):
+        bg_color_tensor = self._parse_hex_color(background_color)
+        
+        results = []
+        for img in images:
+            rgba = self._process_image(
+                img,
+                bg_color_tensor,
+                threshold,
+                close_gaps,
+                edge_feather,
+                matte_shift,
+                min_foreground_area,
+                min_hole_area,
+            )
+            results.append(rgba)
+        
+        batch = torch.stack(results, dim=0).clamp(0.0, 1.0)
+        return (batch,)
+
+NODE_CLASS_MAPPINGS = {
+    "DirectoryCharacterMatteExtractor": DirectoryCharacterMatteExtractor,
+    "CharacterMatteExtractor": CharacterMatteExtractor,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "DirectoryCharacterMatteExtractor": "Directory Character Matte Extractor",
+    "CharacterMatteExtractor": "Character Matte Extractor",
+}
