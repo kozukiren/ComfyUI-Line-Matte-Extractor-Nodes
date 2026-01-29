@@ -1,225 +1,313 @@
 # ComfyUI Line / Matte Extractor Nodes
 
 スキャンした線画や、白い（または黄ばんだ）紙の上に描かれたキャラクターから、
-**線画抽出** と **背景透過（マット生成）** を行うための ComfyUI カスタムノードセットです。
+**線画抽出** と **背景透過（マット生成）** を行うための ComfyUI カスタムノードセットです。 
 
 このリポジトリには以下が含まれます：
 
-* `line_art_extractor.py`  
-  * 単体画像の線画抽出ノード `LineArtExtractor`
-  * 動画ファイルから線画連番を生成するノード `VideoLineArtExtractor`
-  * 連番画像フォルダ用の線画抽出ノード `DirectoryLineArtExtractor`
+* `line_art_extractor.py` :contentReference[oaicite:2]{index=2}
+  * 単体画像の線画抽出ノード：`LineArtExtractor`
+  * 動画ファイルから線画連番を生成：`VideoLineArtExtractor`
+  * 連番画像フォルダ用の線画抽出：`DirectoryLineArtExtractor`
 
-* `character_matte_extractor.py`  
-  * カラーキャラクター＋白（または黄ばんだ）背景からマットを生成するノード `DirectoryCharacterMatteExtractor`
+* `character_matte_extractor.py` :contentReference[oaicite:3]{index=3}
+  * 単体画像から背景透過：`CharacterMatteExtractor`
+  * 連番画像フォルダから背景透過：`DirectoryCharacterMatteExtractor`
 
-* `透過.json`  
-  * 上記ノードを使ったサンプルワークフロー（単体画像線画／連番線画／カラーキャラ透過）
+* `flat_color_posterizer.py`（オプション機能） :contentReference[oaicite:4]{index=4}
+  * 陰影・ハイライトをならしつつ指定色数でベタ塗り化：`FlatColorPosterizer`
+
+* `js/character_matte_extractor.js` :contentReference[oaicite:5]{index=5}
+  * `CharacterMatteExtractor` / `DirectoryCharacterMatteExtractor` の
+    `background_color` を **スポイト（EyeDropper）で拾うUI** を追加します（対応ブラウザのみ）。
+
+* `透過.json` :contentReference[oaicite:6]{index=6}
+  * 収録ノードを使ったサンプルワークフロー（単体線画／連番線画／連番キャラ透過）
 
 ---
 
 ## 対応環境
 
-* ComfyUI 0.3.7 以降（デスクトップ版で動作確認）
+* ComfyUI（デスクトップ版で動作確認）
 * Python 3.10+（ComfyUI 同梱の環境でOK）
-* 追加ライブラリ
+* 追加ライブラリ（`requirements.txt`） :contentReference[oaicite:7]{index=7}
+  * `opencv-python`（動画読み込み・マット抽出で使用）
+  * `scikit-learn`（Flat Color Posterizer の色数削減で使用）
 
-  * `Pillow`
-  * `numpy`
-  * `opencv-python`（動画読み込みノードを使う場合）
-
-※ 通常は `ComfyUI-Manager` で依存関係を自動インストールするか、
-仮想環境上で `pip install pillow numpy opencv-python` で導入してください。
+※ `Pillow` / `numpy` は多くの ComfyUI 環境で同梱されていますが、環境によっては別途必要です。 
 
 ---
 
 ## インストール
 
-1. ComfyUI の `custom_nodes` フォルダを開く
+1. ComfyUI の `custom_nodes` フォルダを開く  
+   例：`/Users/あなたのユーザー名/AI/custom_nodes/`
 
-   * 例：`/Users/あなたのユーザー名/AI/custom_nodes/`
-
-2. このリポジトリをクローンまたはコピー
+2. このリポジトリをクローン
 
    ```bash
    cd custom_nodes
    git clone https://github.com/kozukiren/ComfyUI-Line-Matte-Extractor-Nodes.git
-   ```
+もしくはフォルダごと custom_nodes 配下へ配置。
 
-   もしくはフォルダごと `custom_nodes` 配下へドラッグ＆ドロップ。
+ComfyUI を再起動
 
-3. ComfyUI を再起動
+ノード検索（TAB / 右クリック → ノードを追加）で以下が出ていれば導入完了：
 
-4. ノード検索 (`TAB` / `右クリック → ノードを追加`) で
+Line Art Extractor (PNG)
 
-   * `Line Art Extractor (PNG)`
-   * `Directory Line Art Extractor`
-   * `Directory Character Matte Extractor`
-     が追加されていれば導入完了です。
+Video Line Art Extractor (PNG sequence)
 
----
+Directory Line Art Extractor (PNG sequence)
 
-## 収録ノード
+Character Matte Extractor
 
-### 1. LineArtExtractor
+Directory Character Matte Extractor
 
-**用途**
-1枚の入力画像から線画を抽出し、**透過PNG 用の RGBA IMAGE** を返すノード。
+Flat Color Posterizer
 
-**INPUT**
+収録ノード
+1. Line Art Extractor (PNG)（LineArtExtractor）
+用途
+1枚の入力画像から線画を抽出し、透過PNG向け RGBA IMAGE を返します。 
+line_art_extractor
 
-* `image` : IMAGE
 
-  * ComfyUI 標準 `LoadImage` などから接続
-* `threshold` : FLOAT (0–1, default 0.5)
+INPUT
 
-  * どの明るさまで線として残すかのしきい値
-* `invert_input` : BOOLEAN
+image : IMAGE
 
-  * 白地に黒線なら True
-  * 黒地に白線など、線と背景が逆のとき False
-* `median_filter` : INT (1,3,5,…) (default 3)
+threshold : FLOAT (0–1, default 0.5)
 
-  * 小さなゴミをならすメディアンフィルタのサイズ
+どの明るさまで「線」として残すかのしきい値
 
-**OUTPUT**
+invert_input : BOOLEAN (default False)
 
-* `line_art` : IMAGE
+白背景に黒線（一般的なスキャン線画）の場合は True 推奨
 
-  * RGBA (0–1) のバッチ。線は黒、背景はアルファ0。
+黒背景に白線など、反転不要な素材は False
 
----
+median_filter : INT (odd: 1,3,5,…) (default 3)
 
-### 2. DirectoryLineArtExtractor
+小さなゴミをならすメディアンフィルタ
 
-**用途**
-PNG / JPG 連番が入ったフォルダから **全フレームの線画をまとめて抽出** し、IMAGE バッチとして返すノード。
+OUTPUT
 
-**INPUT**
+line_art : IMAGE
 
-* `directory_path` : STRING
+RGBA のバッチ。線は黒、背景はアルファ0。 
+line_art_extractor
 
-  * `0001.png, 0002.png, …` のような連番が入ったフォルダパス
-* `threshold` : FLOAT
-* `invert_input` : BOOLEAN
-* `median_filter` : INT
 
-（パラメータの意味は `LineArtExtractor` と同じ）
+2. Directory Line Art Extractor (PNG sequence)（DirectoryLineArtExtractor）
+用途
+連番画像が入ったフォルダから 全フレームの線画を一括抽出 して IMAGE バッチで返します。 
+line_art_extractor
 
-**OUTPUT**
 
-* `line_art_frames` : IMAGE
+INPUT
 
-  * 連番全体が1つの IMAGE バッチにまとまっています。
-  * `SaveAnimatedPNG` や `SaveAnimatedWEBP` にそのまま接続できます。
+directory_path : STRING
 
----
+0001.png, 0002.png, … のような連番が入ったフォルダパス
 
-### 3. DirectoryCharacterMatteExtractor
+対応拡張子：png/jpg/jpeg/bmp/tif/tiff 
+line_art_extractor
 
-**用途**
-単色背景の上に描かれた**カラーキャラクターの連番画像**から、
-キャラだけ切り抜いて **背景透過PNG** にするノード。
-背景が白い場合、目や服の白など「キャラ内部の白」は残しつつ、
-キャラの外側に広がる紙だけを透明化します。
 
-**INPUT**
+threshold / invert_input / median_filter
 
-* `directory_path` : STRING
+意味は LineArtExtractor と同じ
 
-  * PNG / JPG 連番フォルダ
-* `bg_tolerance` : FLOAT (default 0.10)
+OUTPUT
 
-  * 背景色をスポイトで選択
+line_art_frames : IMAGE
 
-  * これより暗いピクセルは紙候補にしない（影や塗りの保護）
-* `saturation_max` : FLOAT (default 0.40)
+連番全体が1つの IMAGE バッチにまとまっています。 
+line_art_extractor
 
-  * これより彩度が高い色は紙ではなくキャラ側と判断
-* `close_gaps` : INT (default 2)
 
-  * 線のスキマを何pxぶん埋めるか（背景リーク防止）
-* `edge_feather` : INT (default 2)
+3. Video Line Art Extractor (PNG sequence)（VideoLineArtExtractor）
+用途
+白黒動画（または線画動画）からフレームを抜き、線画透過の RGBA 連番を返します。 
+line_art_extractor
 
-  * アルファのエッジをどの程度ぼかすか
-* `matte_shift` : INT (default -1)
 
-  * 抜きマットを内側/外側に何pxシフトさせるか
-  * プラス = 外側に広げる（欠け防止）
-  * マイナス = 内側に食い込む（白フチ削り）
-* `min_foreground_area` : INT (default 35)
+INPUT
 
-  * これより小さい前景の島はゴミとみなして削除
-* `min_hole_area` : INT (default 10000 程度推奨)
+video_path : STRING（フルパス）
 
-  * キャラ内部の「紙色の穴」の最小サイズ
-  * これより大きい穴（腕と体の隙間など）は背景として抜き、
-    小さい穴（目のハイライト等）は残す
+threshold / invert_input / median_filter
 
-**OUTPUT**
+sample_every : INT (default 1)
 
-* `images` : IMAGE
+何フレームごとに処理するか（1=全フレーム） 
+line_art_extractor
 
-  * RGBA バッチ。キャラは不透明、背景紙はアルファ0。
 
----
+OUTPUT
 
-## サンプルワークフロー（透過.json）
+line_art_frames : IMAGE
 
-`透過.json` は、上記ノードの使い方をまとめたサンプルワークフローです。
+4. Directory Character Matte Extractor（DirectoryCharacterMatteExtractor）
+用途
+白〜黄ばんだ紙の上に描かれた カラーキャラクターの連番画像から、
+キャラだけ切り抜いて 背景透過 RGBA にするノードです。 
+character_matte_extractor
 
-### 内容
 
-* グループ1：**画像一枚ずつ透過**
+このノードは「背景色（紙色）に近いピクセル」を背景候補として抽出し、
+画像の外周から繋がっている部分だけを背景として透明化します。
+そのため、目や服の白など「キャラ内部の白」は残しやすい設計です。 
+character_matte_extractor
 
-  * `LoadImage → LineArtExtractor → PreviewImage / SaveImage`
-* グループ2：**連番線画の一括透過＆アニメ書き出し**
 
-  * `DirectoryLineArtExtractor → SaveAnimatedPNG / SaveAnimatedWEBP`
-* グループ3：**色付きキャラ＋白背景の透過**
+INPUT
 
-  * `DirectoryCharacterMatteExtractor → SaveAnimatedWEBP / SaveAnimatedPNG`
+directory_path : STRING
 
-各グループには日本語の `Note` ノードで使用手順が書かれているので、
-ワークフローをそのまま読み込んでパラメータをいじりながら確認できます。
+PNG/JPG 連番フォルダ（.png/.jpg/.jpeg） 
+character_matte_extractor
 
----
 
-## 使い始めのおすすめ設定
+background_color : STRING (default #FFFFFF)
 
-### 線画抽出（LineArt系）
+抜きたい紙の代表色（HEX）
 
-* `threshold` : 0.5 からスタート
+js/character_matte_extractor.js が有効ならスポイトで指定できます（対応ブラウザのみ）。
 
-  * 線が薄く消える → 0.35〜0.45 に下げる
-  * ゴミが多い／ベタが残りすぎ → 0.6 前後まで上げる
-* `median_filter` : 3
+threshold : FLOAT (default 0.10)
 
-  * スキャン線画やアナログ原稿におすすめ
+background_color との色距離がこの値以下を「背景候補」とみなします。 
+character_matte_extractor
 
-### キャラ透過（DirectoryCharacterMatteExtractor）
 
-1. まず `min_hole_area` を大きめ（例：10000）にして
-   「外側の紙だけ」きれいに抜ける設定を探す
-2. 腕と体の隙間なども抜きたくなったら、
-   `min_hole_area` を少しずつ下げて、
-   抜きたい穴だけが引っ掛かるラインを探す
-3. 紙が黄ばんでいる場合は `saturation_max` を 0.3〜0.4 に
+close_gaps : INT (default 1)
 
----
+キャラ輪郭の小さな隙間を埋めて、背景の侵入（リーク）を抑えます。 
+character_matte_extractor
 
-## ライセンス
 
-* コード・ワークフローともにお好きに改造・利用して構いません。
-  作品内での使用時に作者表記は不要ですが、
-  もしクレジット頂ける場合は `KALIN / comfyui-line-matte-extractor` としていただけると嬉しいです。
+edge_feather : INT (default 2)
 
----
+アルファ境界をぼかして馴染ませます。 
+character_matte_extractor
 
-## 作者
 
-* KALIN
+matte_shift : INT (default 0)
 
-フィードバックや改善案があれば X　
-https://x.com/kozukiren
-でぜひ教えてください。
+マットの膨張/収縮
+
+プラス = 外側に広げる（欠け防止）
+
+マイナス = 内側に縮める（白フチ削り） 
+character_matte_extractor
+
+
+min_foreground_area : INT (default 16)
+
+小さすぎる前景の島をゴミとして除去します。 
+character_matte_extractor
+
+
+min_hole_area : INT (default 128)
+
+キャラ内部にできた「背景色の穴」のうち、
+面積が大きい穴だけを“背景として抜く”（透明にする）ためのしきい値です。
+小さい穴（ハイライト等）は残しやすくなります。 
+character_matte_extractor
+
+
+OUTPUT
+
+images : IMAGE
+
+RGBA バッチ。キャラは不透明、背景はアルファ0。 
+character_matte_extractor
+
+
+5. Character Matte Extractor（CharacterMatteExtractor）
+用途
+DirectoryCharacterMatteExtractor の「単体画像（IMAGE入力）」版です。 
+character_matte_extractor
+
+
+パラメータは同一で、IMAGEバッチをそのまま処理して RGBA を返します。
+
+6. Flat Color Posterizer（FlatColorPosterizer）
+用途
+入力画像から陰影・ハイライトをならし、指定した色数で **ベタ塗り化（ポスタライズ）**します。 
+flat_color_posterizer
+
+
+注意
+
+opencv-python と scikit-learn が必要です。
+
+INPUT（抜粋）
+
+images : IMAGE
+
+num_colors : INT (2–16, default 4)
+
+smoothing_radius : INT (default 5)
+
+edge_preserve : FLOAT (0–1, default 0.1)
+
+color1_hex 〜 color8_hex（任意）
+
+パレット色をHEXで指定（指定した分だけ優先して使います）。 
+flat_color_posterizer
+
+
+OUTPUT
+
+images : IMAGE
+
+サンプルワークフロー（透過.json）
+透過.json は、線画抽出（単体／連番）とキャラ透過（連番）の使い方をまとめたサンプルです。 
+透過
+
+
+※ ワークフロー内に Fast Groups Muter (rgthree) が含まれるため、未導入環境ではそのノードだけ置き換え/削除してください。 
+透過
+
+
+使い始めのおすすめ設定
+線画抽出（LineArt系）
+threshold : 0.5 からスタート
+
+線が薄く消える → 0.35〜0.45 に下げる
+
+ゴミが多い／ベタが残りすぎ → 0.6 前後まで上げる
+
+invert_input
+
+白背景に黒線（一般的なスキャン線画）→ True 推奨
+
+median_filter : 3
+
+スキャン線画やアナログ原稿におすすめ
+
+キャラ透過（CharacterMatte系）
+まず background_color を「紙色」に合わせる（白紙以外はここが最重要）
+
+次に threshold を調整
+
+紙が残る → 少し上げる
+
+キャラの薄い色まで抜ける → 少し下げる
+
+紙が輪郭の内側に入り込む → close_gaps を上げる
+
+白フチが気になる → matte_shift をマイナスへ（少しずつ）
+
+欠けが気になる → matte_shift をプラスへ（少しずつ）
+
+腕と体の隙間など「大きい穴」も抜きたい → min_hole_area を下げる
+逆に目ハイライト等を残したい → min_hole_area を上げる
+
+ライセンス
+コード・ワークフローともにお好きに改造・利用して構いません。
+作品内での使用時に作者表記は不要ですが、
+もしクレジット頂ける場合は KALIN / comfyui-line-matte-extractor としていただけると嬉しいです。
